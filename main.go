@@ -1,34 +1,24 @@
 package main
 
 import (
-	"bytes"
-	"encoding/gob"
-	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/boltdb/bolt"
-	"github.com/is8ac/link-crawler/linkdb"
 )
 
-func getLinks(bucket *bolt.Bucket, svc *dynamodb.DynamoDB, page string) []string {
-	links, err := boltReadLinks(bucket, page)
+func getLinks(db *bolt.DB, page string) []string {
+	links, err := boltReadLinks(db, page)
 	if err != nil {
-		fmt.Println(page, " is not in bolt")
-		links, err = linkdb.ReadLinks(svc, page)
-		if err != nil {
-			fmt.Println("scraping", page)
-			links = scrapeLinks(page)
-			boltWriteLinks(bucket, page, links)
-			time.Sleep(time.Duration(rand.Int31n(8000)) * time.Millisecond)
-		}
+		fmt.Println("scraping", page)
+		links = scrapeLinks(page)
+		boltWriteLinks(db, page, links)
+		time.Sleep(time.Duration(rand.Int31n(3000)) * time.Millisecond) // Be kind
 	}
-	return linkdb.StringFilter(links)
+	return stringFilter(links)
 }
 
 func memberOf(list []string, link string) bool {
@@ -40,75 +30,102 @@ func memberOf(list []string, link string) bool {
 	return false
 }
 
-func recursScrape(svc *dynamodb.DynamoDB, bucket *bolt.Bucket, page string, recursCount int) {
+func recursScrape(db *bolt.DB, linkMap *map[string][]string, page string, recursCount int) {
 	if recursCount > 0 {
-		var scrapedLinks []string
-		links := getLinks(bucket, svc, page)
-		fmt.Println(recursCount, page, "has", len(links), "links")
-		boltWriteLinks(bucket, page, links)
+		links := getLinks(db, page)
+		//fmt.Println(recursCount, page, "has", len(links), "links")
+		(*linkMap)[page] = links
 		for _, page := range links {
-			if !memberOf(scrapedLinks, page) {
-				recursScrape(svc, bucket, page, recursCount-1)
+			if _, exists := (*linkMap)[page]; !exists {
+				recursScrape(db, linkMap, page, recursCount-1)
 			}
 		}
 	}
 }
 
-func boltWriteLinks(bucket *bolt.Bucket, page string, links []string) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-
-	err := enc.Encode(links)
-	if err != nil {
-		log.Fatal("encode error:", err)
-	}
-	data := buf.Bytes()
-	err = bucket.Put([]byte(page), data)
-	if err != nil {
-		log.Println(err)
-	}
-}
-
-func boltReadLinks(bucket *bolt.Bucket, page string) (links []string, err error) {
-	val := bucket.Get([]byte(page))
-	if len(val) == 0 {
-		err = errors.New("empty")
-		return
-	}
-	dec := gob.NewDecoder(bytes.NewReader(val))
-
-	err = dec.Decode(&links)
-	return
+var filterLists = []filterList{
+	{White: true, Globs: []string{
+	//"*",
+	}},
+	{White: false, Globs: []string{
+		"*archive.org*",
+		"*.pdf",
+		"*.csv",
+		"*.txt",
+		"*.png",
+		"*.xls",
+		"*.xlsx",
+		"*.jpeg",
+		"*.jpg",
+		"*.svg",
+		"*.ogg",
+		"*wikipedia.org/wiki/Wikipedia:*",
+		"*wikipedia.org/wiki/Category:*",
+		"*wikipedia.org/wiki/Portal:*",
+		"*wikipedia.org/wiki/Special:*",
+		"*wikipedia.org/wiki/Help:*",
+		"*wikipedia.org/wiki/Talk:*",
+		"*wikipedia.org/wiki/File:*",
+		"*wikipedia.org/wiki/Template_talk:*",
+		"*wikipedia.org/wiki/Template:*",
+		"*wikipedia.org/wiki/Main_Page*",
+		"*slatestarcodex.com/20[0-9][0-9]/[0-9][0-9]",
+		"*slatestarcodex.com/20[0-9][0-9]/",
+		"*slatestarcodex.com/*terrorists-vs-chairs*",
+		"*slatestarcodex.com/*open-thread-57-75",
+		"*slatestarcodex.com/*open-thread-57-25",
+		"*slatestarcodex.com/*open-thread-57-5",
+		"*slatestarcodex.com/*reverse-*-brand-name-drugs",
+		"http://en.wikipedia.org/wiki/International_Standard_Book_Number",
+		"http://en.wikipedia.org/wiki/*(disambiguation)",
+		//"*slatstarcodex.com//*",
+		//"*analog*",
+	}},
+	{White: true, Globs: []string{
+		//"*",
+		"*en.wikipedia.org/wiki/*",
+		//"*//slatestarcodex.com",
+		//"*slatestarcodex.com/20[0-9][0-9]/[0-9][0-9]/*",
+		//"*en.wikipedia*",
+		//"*http://isaacleonard.com*",
+	}},
+	{White: false, Globs: []string{
+		"*.wikipedia.org*",
+		"*wikimedia.org*",
+		"*wikimediafoundation.org*",
+		"*mediawiki.org*",
+		"*wikidata.org*",
+		"*dbpedia.org*",
+		"*amazonaws.com*",
+		"*",
+	}},
+	{White: true, Globs: []string{"*"}},
 }
 
 func main() {
-	sess, err := session.NewSession()
-	if err != nil {
-		fmt.Println("failed to create session,", err)
-		return
-	}
-	svc := dynamodb.New(sess)
-	_ = svc
-	db, err := bolt.Open("./bolt.db", 0644, nil)
+	db, err := bolt.Open("bolt.db", 0644, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
+	linkMap := make(map[string][]string)
+
 	// store some data
 	err = db.Update(func(tx *bolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists([]byte("links"))
+		_, createErr := tx.CreateBucketIfNotExists([]byte("links"))
 		if err != nil {
-			return err
-		}
-		for _, page := range os.Args[1:] {
-			_ = page
-			recursScrape(svc, bucket, page, 3)
+			return createErr
 		}
 		return nil
 	})
-
 	if err != nil {
 		log.Fatal(err)
 	}
+	for _, page := range os.Args[1:] {
+		_ = page
+		recursScrape(db, &linkMap, page, 3)
+	}
+	//fmt.Println(len(linkMap))
+	writeMapToStdout(linkMap)
 }
